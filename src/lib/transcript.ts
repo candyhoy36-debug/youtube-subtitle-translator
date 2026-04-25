@@ -1,5 +1,14 @@
 import type { CaptionTrackInfo, SubtitleSegment, TranscriptResponse } from "./types";
 
+/**
+ * Fetches caption tracks via the InnerTube `ANDROID_VR` (Oculus Quest)
+ * client. Compared to the regular web client, this client is currently
+ * exempt from the per-IP `pot` (proof-of-origin token) check that causes
+ * `timedtext` to return empty bodies for datacenter / CI IPs.
+ *
+ * Reference: this is the same client `yt-dlp` falls back to by default.
+ */
+
 interface YtCaptionTrack {
   baseUrl: string;
   name?: { simpleText?: string; runs?: { text: string }[] };
@@ -14,8 +23,19 @@ interface YtJson3Event {
   segs?: { utf8?: string }[];
 }
 
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+interface PlayerResponse {
+  videoDetails?: { title?: string };
+  playabilityStatus?: { status?: string; reason?: string };
+  captions?: {
+    playerCaptionsTracklistRenderer?: { captionTracks?: YtCaptionTrack[] };
+  };
+}
+
+const ANDROID_VR_USER_AGENT =
+  "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+
+const INNERTUBE_PLAYER_URL =
+  "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
 function decodeHtmlEntities(s: string): string {
   return s
@@ -34,44 +54,48 @@ function readableLanguageName(track: YtCaptionTrack): string {
   return name || track.languageCode;
 }
 
-async function fetchWatchPage(videoId: string): Promise<string> {
-  const url = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      "Accept-Language": "en-US,en;q=0.9",
+async function fetchPlayerResponse(videoId: string): Promise<PlayerResponse> {
+  const body = {
+    videoId,
+    contentCheckOk: true,
+    racyCheckOk: true,
+    context: {
+      client: {
+        clientName: "ANDROID_VR",
+        clientVersion: "1.62.27",
+        deviceMake: "Oculus",
+        deviceModel: "Quest 3",
+        androidSdkVersion: 32,
+        userAgent: ANDROID_VR_USER_AGENT,
+        hl: "en",
+        gl: "US",
+        timeZone: "UTC",
+        utcOffsetMinutes: 0,
+      },
     },
+  };
+
+  const res = await fetch(INNERTUBE_PLAYER_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": ANDROID_VR_USER_AGENT,
+      "X-Goog-Api-Format-Version": "2",
+    },
+    body: JSON.stringify(body),
     cache: "no-store",
   });
+
   if (!res.ok) {
-    throw new Error(`Failed to fetch YouTube watch page (${res.status}).`);
+    throw new Error(`InnerTube player API failed (${res.status}).`);
   }
-  return res.text();
+  return (await res.json()) as PlayerResponse;
 }
 
-function extractCaptionTracks(html: string): YtCaptionTrack[] {
-  // ytInitialPlayerResponse may be assigned via `var ytInitialPlayerResponse = {...};`
-  // or embedded as `ytInitialPlayerResponse":{...}` inside a larger blob.
-  const match =
-    html.match(/var ytInitialPlayerResponse\s*=\s*(\{.+?\});/) ||
-    html.match(/ytInitialPlayerResponse"\s*:\s*(\{.+?\})\s*,\s*"/);
-  if (!match) return [];
-  const jsonText = match[1];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonText);
-  } catch {
-    return [];
-  }
-  const captions = (parsed as {
-    captions?: {
-      playerCaptionsTracklistRenderer?: { captionTracks?: YtCaptionTrack[] };
-    };
-  })?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  return Array.isArray(captions) ? captions : [];
-}
-
-function pickBestTrack(tracks: YtCaptionTrack[], preferred?: string): YtCaptionTrack | null {
+function pickBestTrack(
+  tracks: YtCaptionTrack[],
+  preferred?: string,
+): YtCaptionTrack | null {
   if (tracks.length === 0) return null;
   const isManual = (t: YtCaptionTrack) => t.kind !== "asr";
   const byLang = (lang: string) =>
@@ -83,7 +107,6 @@ function pickBestTrack(tracks: YtCaptionTrack[], preferred?: string): YtCaptionT
     if (t) return t;
   }
 
-  // Prefer English manual, then any manual, then English asr, then first.
   return (
     byLang("en") ||
     tracks.find(isManual) ||
@@ -92,10 +115,14 @@ function pickBestTrack(tracks: YtCaptionTrack[], preferred?: string): YtCaptionT
   );
 }
 
+function withFmt(baseUrl: string, fmt: string): string {
+  return `${baseUrl.replace(/[?&]fmt=[^&]*/g, "")}&fmt=${fmt}`;
+}
+
 async function fetchTrackJson3(baseUrl: string): Promise<YtJson3Event[]> {
-  const url = baseUrl.includes("fmt=") ? baseUrl : `${baseUrl}&fmt=json3`;
+  const url = withFmt(baseUrl, "json3");
   const res = await fetch(url, {
-    headers: { "User-Agent": USER_AGENT },
+    headers: { "User-Agent": ANDROID_VR_USER_AGENT },
     cache: "no-store",
   });
   if (!res.ok) {
@@ -132,7 +159,7 @@ function eventsToSegments(events: YtJson3Event[]): SubtitleSegment[] {
     });
   }
   // Some auto-caption tracks emit overlapping rolling events. Deduplicate by
-  // collapsing entries whose text is fully contained in the previous one.
+  // collapsing entries whose text exactly matches the previous one.
   const cleaned: SubtitleSegment[] = [];
   for (const seg of segments) {
     const last = cleaned[cleaned.length - 1];
@@ -146,8 +173,16 @@ export async function fetchTranscript(
   videoId: string,
   preferredLang?: string,
 ): Promise<TranscriptResponse> {
-  const html = await fetchWatchPage(videoId);
-  const tracks = extractCaptionTracks(html);
+  const player = await fetchPlayerResponse(videoId);
+
+  const status = player.playabilityStatus?.status;
+  if (status && status !== "OK") {
+    throw new Error(
+      player.playabilityStatus?.reason ?? `Video không phát được (${status}).`,
+    );
+  }
+
+  const tracks = player.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
   if (tracks.length === 0) {
     throw new Error("Video này không có phụ đề.");
   }

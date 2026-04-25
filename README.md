@@ -1,36 +1,59 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# YouTube Subtitle Translator
 
-## Getting Started
+Paste a YouTube URL → watch the video with the original subtitles overlaid on
+top of a Vietnamese translation, plus a scrollable list of every line and a
+"merge into sentences" mode that re-groups subtitle fragments into full
+sentences.
 
-First, run the development server:
+Only videos that already have subtitles on YouTube are supported (manual or
+auto-generated).
+
+## Features
+
+- Original (line 1) + Vietnamese (line 2) overlay synced to the player time.
+- Scrollable subtitle list that highlights the active line and auto-scrolls
+  to it. Click any line to seek the player.
+- "Ghép thành câu hoàn chỉnh" toggle: merges short subtitle fragments into
+  natural sentences (using punctuation when present, falling back to silence
+  gaps for auto-generated tracks). Sentences are re-translated for higher
+  fluency.
+- Free, no API key — translations go through the unofficial
+  `translate.googleapis.com` endpoint. Rate limits are best-effort.
+
+## Tech stack
+
+- Next.js 16 (App Router) + React 19
+- TypeScript
+- Tailwind CSS v4
+- YouTube IFrame Player API for playback
+
+## How subtitles are fetched
+
+YouTube's regular `timedtext` endpoint now returns empty bodies when called
+from datacenter / CI IPs without a valid `pot` (proof-of-origin token). This
+project sidesteps that the same way `yt-dlp` does: it calls the InnerTube
+`/youtubei/v1/player` endpoint with the `ANDROID_VR` (Oculus Quest) client
+context, which is currently exempt from the `pot` check, then fetches the
+returned `baseUrl` with the matching VR User-Agent.
+
+The implementation lives in `src/lib/transcript.ts`.
+
+## Development
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+npm run dev   # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+```bash
+npm run lint
+npm run build
+```
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Notes
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
-
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- The free Google Translate endpoint can be rate-limited; for production
+  traffic switch to the official Google Cloud Translation API or DeepL.
+- Subtitle fetching depends on YouTube's internal client behaviour — if the
+  `ANDROID_VR` client ever starts requiring `pot` tokens too, this app will
+  need to be updated alongside `yt-dlp`'s upstream fix.
