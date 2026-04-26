@@ -126,10 +126,32 @@ function readableLanguageName(track: YtCaptionTrack): string {
   return name || track.languageCode;
 }
 
-async function fetchVisitorData(): Promise<string | undefined> {
+function normalizeCookies(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+
+  // Already a Cookie header value (e.g. "a=1; b=2")
+  if (!/\n/.test(trimmed) && /=/.test(trimmed)) return trimmed;
+
+  // Netscape cookies.txt format — one cookie per line, tab-separated:
+  // domain  flag  path  secure  expiry  name  value
+  const pairs: string[] = [];
+  for (const line of trimmed.split(/\r?\n/)) {
+    const l = line.trim();
+    if (!l || l.startsWith("#")) continue;
+    const cols = l.split(/\t/);
+    if (cols.length >= 7) pairs.push(`${cols[5]}=${cols[6]}`);
+  }
+  return pairs.length ? pairs.join("; ") : trimmed;
+}
+
+async function fetchVisitorData(cookies?: string): Promise<string | undefined> {
   try {
+    const headers: Record<string, string> = { "User-Agent": WEB_USER_AGENT };
+    if (cookies) headers["Cookie"] = cookies;
     const res = await fetch("https://www.youtube.com/sw.js_data", {
-      headers: { "User-Agent": WEB_USER_AGENT },
+      headers,
       cache: "no-store",
     });
     if (!res.ok) return undefined;
@@ -146,6 +168,7 @@ async function fetchPlayerResponseForClient(
   videoId: string,
   client: ClientConfig,
   visitorData?: string,
+  cookies?: string,
 ): Promise<PlayerResponse> {
   const ctx = visitorData
     ? { ...client.context, visitorData }
@@ -163,6 +186,7 @@ async function fetchPlayerResponseForClient(
     "X-Goog-Api-Format-Version": "2",
   };
   if (visitorData) headers["X-Goog-Visitor-Id"] = visitorData;
+  if (cookies) headers["Cookie"] = cookies;
 
   const res = await fetch(INNERTUBE_PLAYER_URL, {
     method: "POST",
@@ -177,21 +201,24 @@ async function fetchPlayerResponseForClient(
   return (await res.json()) as PlayerResponse;
 }
 
-async function fetchPlayerResponse(videoId: string): Promise<PlayerResponse> {
+async function fetchPlayerResponse(
+  videoId: string,
+  cookies?: string,
+): Promise<PlayerResponse> {
   let visitorData: string | undefined;
   let lastError: Error | null = null;
   let lastBlocked: PlayerResponse | null = null;
 
   for (const client of CLIENTS) {
     try {
-      const player = await fetchPlayerResponseForClient(videoId, client, visitorData);
+      const player = await fetchPlayerResponseForClient(videoId, client, visitorData, cookies);
       const status = player.playabilityStatus?.status;
       const tracks = player.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
 
       if (status === "OK" || tracks.length > 0) return player;
       if (status === "LOGIN_REQUIRED" || status === "ERROR") {
         lastBlocked = player;
-        if (!visitorData) visitorData = await fetchVisitorData();
+        if (!visitorData) visitorData = await fetchVisitorData(cookies);
         continue;
       }
       // UNPLAYABLE / other terminal status — return as-is.
@@ -233,10 +260,12 @@ function withFmt(baseUrl: string, fmt: string): string {
   return `${baseUrl.replace(/[?&]fmt=[^&]*/g, "")}&fmt=${fmt}`;
 }
 
-async function fetchTrackJson3(baseUrl: string): Promise<YtJson3Event[]> {
+async function fetchTrackJson3(baseUrl: string, cookies?: string): Promise<YtJson3Event[]> {
   const url = withFmt(baseUrl, "json3");
+  const headers: Record<string, string> = { "User-Agent": WEB_USER_AGENT };
+  if (cookies) headers["Cookie"] = cookies;
   const res = await fetch(url, {
-    headers: { "User-Agent": WEB_USER_AGENT },
+    headers,
     cache: "no-store",
   });
   if (!res.ok) {
@@ -283,11 +312,21 @@ function eventsToSegments(events: YtJson3Event[]): SubtitleSegment[] {
   return cleaned;
 }
 
+export interface FetchTranscriptOptions {
+  preferredLang?: string;
+  cookies?: string;
+}
+
 export async function fetchTranscript(
   videoId: string,
-  preferredLang?: string,
+  optsOrLang: FetchTranscriptOptions | string = {},
 ): Promise<TranscriptResponse> {
-  const player = await fetchPlayerResponse(videoId);
+  const opts: FetchTranscriptOptions =
+    typeof optsOrLang === "string" ? { preferredLang: optsOrLang } : optsOrLang;
+  const cookies = normalizeCookies(opts.cookies);
+  const preferredLang = opts.preferredLang;
+
+  const player = await fetchPlayerResponse(videoId, cookies);
 
   const status = player.playabilityStatus?.status;
   const reason = player.playabilityStatus?.reason ?? "";
@@ -295,8 +334,8 @@ export async function fetchTranscript(
 
   if (status === "LOGIN_REQUIRED" && tracks.length === 0) {
     throw new Error(
-      `YouTube đang chặn IP của server (${reason || "Sign in required"}). ` +
-        `Video này yêu cầu xác thực. Hãy thử video khác hoặc chạy app từ máy/IP khác.`,
+      `YouTube yêu cầu đăng nhập (${reason || "Sign in required"}). ` +
+        `Hãy bấm "Cookies YouTube" ở cuối trang và dán cookies của bạn vào để app fetch được phụ đề.`,
     );
   }
   if (status && status !== "OK" && tracks.length === 0) {
@@ -311,7 +350,7 @@ export async function fetchTranscript(
     throw new Error("Không tìm được track phụ đề phù hợp.");
   }
 
-  const events = await fetchTrackJson3(chosen.baseUrl);
+  const events = await fetchTrackJson3(chosen.baseUrl, cookies);
   const segments = eventsToSegments(events);
   if (segments.length === 0) {
     throw new Error("Phụ đề rỗng hoặc không thể đọc được.");

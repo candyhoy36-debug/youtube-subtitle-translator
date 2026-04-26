@@ -32,6 +32,20 @@ export default function Home() {
   const [currentTime, setCurrentTime] = useState(0);
   const playerRef = useRef<YTPlayer | null>(null);
 
+  const [cookies, setCookies] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem("yt-cookies") ?? "";
+  });
+  const [cookiesOpen, setCookiesOpen] = useState(false);
+
+  const saveCookies = useCallback((value: string) => {
+    setCookies(value);
+    if (typeof window !== "undefined") {
+      if (value.trim()) window.localStorage.setItem("yt-cookies", value);
+      else window.localStorage.removeItem("yt-cookies");
+    }
+  }, []);
+
   const sentences: SentenceUnit[] = useMemo(() => {
     if (!loaded) return [];
     return mergeSegmentsIntoSentences(loaded.data.segments);
@@ -126,7 +140,11 @@ export default function Home() {
       setVideoId(id);
       setLoadingTranscript(true);
       try {
-        const res = await fetch(`/api/transcript?video=${encodeURIComponent(id)}`);
+        const res = await fetch(`/api/transcript`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ video: id, cookies: cookies || undefined }),
+        });
         const json = await res.json();
         if (!res.ok) {
           throw new Error(json?.error ?? "Không lấy được phụ đề.");
@@ -146,7 +164,7 @@ export default function Home() {
         setLoadingTranscript(false);
       }
     },
-    [urlInput, translateSegments],
+    [urlInput, translateSegments, cookies],
   );
 
   // When sentence mode is toggled on the first time, fetch sentence-level
@@ -305,9 +323,55 @@ export default function Home() {
         )}
       </main>
 
-      <footer className="mx-auto max-w-7xl px-4 py-6 text-xs text-zinc-500">
-        Dịch thuật dùng endpoint Google Translate miễn phí — chất lượng có thể
-        khác bản trả phí. Chỉ hoạt động với video có sẵn phụ đề.
+      <footer className="mx-auto max-w-7xl px-4 py-6 text-xs text-zinc-500 space-y-3">
+        <p>
+          Dịch thuật dùng endpoint Google Translate miễn phí — chất lượng có thể
+          khác bản trả phí. Chỉ hoạt động với video có sẵn phụ đề.
+        </p>
+        <details
+          className="rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2"
+          open={cookiesOpen}
+          onToggle={(e) => setCookiesOpen((e.target as HTMLDetailsElement).open)}
+        >
+          <summary className="cursor-pointer text-zinc-300 select-none">
+            Cookies YouTube (nâng cao)
+            {cookies ? (
+              <span className="ml-2 text-emerald-400">• đã lưu</span>
+            ) : null}
+          </summary>
+          <div className="mt-3 space-y-2 text-zinc-400">
+            <p>
+              Nếu gặp lỗi <em>“Sign in to confirm you’re not a bot”</em>, bạn có
+              thể dán cookies YouTube của mình vào đây để app fetch được phụ đề
+              của mọi video bạn xem được trong trình duyệt.
+            </p>
+            <p>
+              Cách lấy nhanh: cài extension{" "}
+              <a
+                className="text-yellow-300 underline"
+                href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Get cookies.txt LOCALLY
+              </a>
+              , mở youtube.com (đã đăng nhập), bấm extension → Export → dán nội
+              dung file vào ô dưới. Cũng có thể dán dạng{" "}
+              <code>name=value; name2=value2</code>.
+            </p>
+            <textarea
+              value={cookies}
+              onChange={(e) => saveCookies(e.target.value)}
+              placeholder="# Netscape HTTP Cookie File ... hoặc name=value; ..."
+              spellCheck={false}
+              className="w-full h-32 rounded bg-zinc-900 border border-zinc-700 p-2 font-mono text-[11px] text-zinc-200 focus:outline-none focus:ring-2 focus:ring-yellow-500/60"
+            />
+            <p className="text-[11px] text-zinc-500">
+              Cookies lưu tại trình duyệt của bạn (localStorage) và chỉ gửi tới
+              server của app này.
+            </p>
+          </div>
+        </details>
       </footer>
     </div>
   );
