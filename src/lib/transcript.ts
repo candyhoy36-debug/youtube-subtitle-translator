@@ -34,8 +34,80 @@ interface PlayerResponse {
 const ANDROID_VR_USER_AGENT =
   "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 
+const IOS_USER_AGENT =
+  "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)";
+
+const TV_USER_AGENT =
+  "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version";
+
+const WEB_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
+
 const INNERTUBE_PLAYER_URL =
   "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+
+interface ClientConfig {
+  name: string;
+  context: Record<string, unknown>;
+  userAgent: string;
+}
+
+const CLIENTS: ClientConfig[] = [
+  {
+    name: "ANDROID_VR",
+    userAgent: ANDROID_VR_USER_AGENT,
+    context: {
+      clientName: "ANDROID_VR",
+      clientVersion: "1.62.27",
+      deviceMake: "Oculus",
+      deviceModel: "Quest 3",
+      androidSdkVersion: 32,
+      userAgent: ANDROID_VR_USER_AGENT,
+      hl: "en",
+      gl: "US",
+      timeZone: "UTC",
+      utcOffsetMinutes: 0,
+    },
+  },
+  {
+    name: "IOS",
+    userAgent: IOS_USER_AGENT,
+    context: {
+      clientName: "IOS",
+      clientVersion: "20.10.4",
+      deviceMake: "Apple",
+      deviceModel: "iPhone16,2",
+      osName: "iPhone",
+      osVersion: "18.3.2.22D82",
+      userAgent: IOS_USER_AGENT,
+      hl: "en",
+      gl: "US",
+    },
+  },
+  {
+    name: "TVHTML5",
+    userAgent: TV_USER_AGENT,
+    context: {
+      clientName: "TVHTML5",
+      clientVersion: "7.20250122.16.00",
+      platform: "TV",
+      userAgent: TV_USER_AGENT,
+      hl: "en",
+      gl: "US",
+    },
+  },
+  {
+    name: "WEB",
+    userAgent: WEB_USER_AGENT,
+    context: {
+      clientName: "WEB",
+      clientVersion: "2.20250101.00.00",
+      userAgent: WEB_USER_AGENT,
+      hl: "en",
+      gl: "US",
+    },
+  },
+];
 
 function decodeHtmlEntities(s: string): string {
   return s
@@ -54,34 +126,47 @@ function readableLanguageName(track: YtCaptionTrack): string {
   return name || track.languageCode;
 }
 
-async function fetchPlayerResponse(videoId: string): Promise<PlayerResponse> {
+async function fetchVisitorData(): Promise<string | undefined> {
+  try {
+    const res = await fetch("https://www.youtube.com/sw.js_data", {
+      headers: { "User-Agent": WEB_USER_AGENT },
+      cache: "no-store",
+    });
+    if (!res.ok) return undefined;
+    const text = await res.text();
+    const m = text.match(/"([A-Za-z0-9_-]{10,})"\s*\]\s*\]\s*,\s*"/);
+    if (m) return m[1];
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}
+
+async function fetchPlayerResponseForClient(
+  videoId: string,
+  client: ClientConfig,
+  visitorData?: string,
+): Promise<PlayerResponse> {
+  const ctx = visitorData
+    ? { ...client.context, visitorData }
+    : client.context;
   const body = {
     videoId,
     contentCheckOk: true,
     racyCheckOk: true,
-    context: {
-      client: {
-        clientName: "ANDROID_VR",
-        clientVersion: "1.62.27",
-        deviceMake: "Oculus",
-        deviceModel: "Quest 3",
-        androidSdkVersion: 32,
-        userAgent: ANDROID_VR_USER_AGENT,
-        hl: "en",
-        gl: "US",
-        timeZone: "UTC",
-        utcOffsetMinutes: 0,
-      },
-    },
+    context: { client: ctx },
   };
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "User-Agent": client.userAgent,
+    "X-Goog-Api-Format-Version": "2",
+  };
+  if (visitorData) headers["X-Goog-Visitor-Id"] = visitorData;
 
   const res = await fetch(INNERTUBE_PLAYER_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": ANDROID_VR_USER_AGENT,
-      "X-Goog-Api-Format-Version": "2",
-    },
+    headers,
     body: JSON.stringify(body),
     cache: "no-store",
   });
@@ -90,6 +175,35 @@ async function fetchPlayerResponse(videoId: string): Promise<PlayerResponse> {
     throw new Error(`InnerTube player API failed (${res.status}).`);
   }
   return (await res.json()) as PlayerResponse;
+}
+
+async function fetchPlayerResponse(videoId: string): Promise<PlayerResponse> {
+  let visitorData: string | undefined;
+  let lastError: Error | null = null;
+  let lastBlocked: PlayerResponse | null = null;
+
+  for (const client of CLIENTS) {
+    try {
+      const player = await fetchPlayerResponseForClient(videoId, client, visitorData);
+      const status = player.playabilityStatus?.status;
+      const tracks = player.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+
+      if (status === "OK" || tracks.length > 0) return player;
+      if (status === "LOGIN_REQUIRED" || status === "ERROR") {
+        lastBlocked = player;
+        if (!visitorData) visitorData = await fetchVisitorData();
+        continue;
+      }
+      // UNPLAYABLE / other terminal status — return as-is.
+      return player;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  if (lastBlocked) return lastBlocked;
+  if (lastError) throw lastError;
+  throw new Error("InnerTube player API failed.");
 }
 
 function pickBestTrack(
@@ -122,7 +236,7 @@ function withFmt(baseUrl: string, fmt: string): string {
 async function fetchTrackJson3(baseUrl: string): Promise<YtJson3Event[]> {
   const url = withFmt(baseUrl, "json3");
   const res = await fetch(url, {
-    headers: { "User-Agent": ANDROID_VR_USER_AGENT },
+    headers: { "User-Agent": WEB_USER_AGENT },
     cache: "no-store",
   });
   if (!res.ok) {
@@ -176,13 +290,18 @@ export async function fetchTranscript(
   const player = await fetchPlayerResponse(videoId);
 
   const status = player.playabilityStatus?.status;
-  if (status && status !== "OK") {
+  const reason = player.playabilityStatus?.reason ?? "";
+  const tracks = player.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+
+  if (status === "LOGIN_REQUIRED" && tracks.length === 0) {
     throw new Error(
-      player.playabilityStatus?.reason ?? `Video không phát được (${status}).`,
+      `YouTube đang chặn IP của server (${reason || "Sign in required"}). ` +
+        `Video này yêu cầu xác thực. Hãy thử video khác hoặc chạy app từ máy/IP khác.`,
     );
   }
-
-  const tracks = player.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+  if (status && status !== "OK" && tracks.length === 0) {
+    throw new Error(reason || `Video không phát được (${status}).`);
+  }
   if (tracks.length === 0) {
     throw new Error("Video này không có phụ đề.");
   }
