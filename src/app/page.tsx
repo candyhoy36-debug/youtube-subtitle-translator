@@ -1,65 +1,395 @@
-import Image from "next/image";
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import YouTubePlayer, { type YTPlayer } from "@/components/YouTubePlayer";
+import SubtitleOverlay from "@/components/SubtitleOverlay";
+import SubtitleList, { type SubtitleListItem } from "@/components/SubtitleList";
+import { extractVideoId } from "@/lib/youtube-id";
+import {
+  findActiveIndex,
+  mergeSegmentsIntoSentences,
+  type SentenceUnit,
+} from "@/lib/sentences";
+import type { TranscriptResponse } from "@/lib/types";
+
+interface LoadedTranscript {
+  data: TranscriptResponse;
+  segmentTranslations: string[];
+}
 
 export default function Home() {
+  const [urlInput, setUrlInput] = useState("");
+  const [videoId, setVideoId] = useState<string | null>(null);
+  const [loadingTranscript, setLoadingTranscript] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState<LoadedTranscript | null>(null);
+  const [translatingSegments, setTranslatingSegments] = useState(false);
+
+  const [sentenceMode, setSentenceMode] = useState(false);
+  const [sentenceTranslations, setSentenceTranslations] = useState<string[] | null>(null);
+  const [translatingSentences, setTranslatingSentences] = useState(false);
+
+  const [currentTime, setCurrentTime] = useState(0);
+  const playerRef = useRef<YTPlayer | null>(null);
+
+  const [cookies, setCookies] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem("yt-cookies") ?? "";
+  });
+  const [cookiesOpen, setCookiesOpen] = useState(false);
+
+  const saveCookies = useCallback((value: string) => {
+    setCookies(value);
+    if (typeof window !== "undefined") {
+      if (value.trim()) window.localStorage.setItem("yt-cookies", value);
+      else window.localStorage.removeItem("yt-cookies");
+    }
+  }, []);
+
+  const sentences: SentenceUnit[] = useMemo(() => {
+    if (!loaded) return [];
+    return mergeSegmentsIntoSentences(loaded.data.segments);
+  }, [loaded]);
+
+  // Derived translations for sentences from segment translations as a fallback
+  // until we get a higher-quality sentence-level translation.
+  const fallbackSentenceTranslations = useMemo(() => {
+    if (!loaded) return [];
+    return sentences.map((s) =>
+      s.segmentIndexes
+        .map((i) => loaded.segmentTranslations[i] ?? "")
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim(),
+    );
+  }, [loaded, sentences]);
+
+  const items: SubtitleListItem[] = useMemo(() => {
+    if (!loaded) return [];
+    if (sentenceMode) {
+      const translations = sentenceTranslations ?? fallbackSentenceTranslations;
+      return sentences.map((s, i) => ({
+        start: s.start,
+        end: s.end,
+        original: s.text,
+        translated: translations[i],
+      }));
+    }
+    return loaded.data.segments.map((s, i) => ({
+      start: s.start,
+      end: s.end,
+      original: s.text,
+      translated: loaded.segmentTranslations[i],
+    }));
+  }, [
+    loaded,
+    sentenceMode,
+    sentences,
+    sentenceTranslations,
+    fallbackSentenceTranslations,
+  ]);
+
+  const activeIndex = useMemo(
+    () => findActiveIndex(items, currentTime),
+    [items, currentTime],
+  );
+
+  const activeItem = activeIndex >= 0 ? items[activeIndex] : undefined;
+
+  const translateSegments = useCallback(async (data: TranscriptResponse) => {
+    setTranslatingSegments(true);
+    try {
+      const texts = data.segments.map((s) => s.text);
+      const res = await fetch("/api/translate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ texts, target: "vi" }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json?.error ?? "Dịch thất bại.");
+      const translations = (json.translations as string[]) ?? [];
+      setLoaded((prev) =>
+        prev
+          ? {
+              ...prev,
+              segmentTranslations: translations,
+            }
+          : prev,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Dịch thất bại.";
+      setErrorMessage((current) => current ?? message);
+    } finally {
+      setTranslatingSegments(false);
+    }
+  }, []);
+
+  const handleSubmit = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      const id = extractVideoId(urlInput);
+      if (!id) {
+        setErrorMessage("URL không hợp lệ. Hãy paste link YouTube đầy đủ.");
+        return;
+      }
+      setErrorMessage(null);
+      setLoaded(null);
+      setSentenceTranslations(null);
+      setSentenceMode(false);
+      setVideoId(id);
+      setLoadingTranscript(true);
+      try {
+        const res = await fetch(`/api/transcript`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ video: id, cookies: cookies || undefined }),
+        });
+        const json = await res.json();
+        if (!res.ok) {
+          throw new Error(json?.error ?? "Không lấy được phụ đề.");
+        }
+        const data = json as TranscriptResponse;
+        setLoaded({
+          data,
+          segmentTranslations: data.segments.map(() => ""),
+        });
+        // Kick off translation immediately.
+        translateSegments(data);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Lỗi không xác định.";
+        setErrorMessage(message);
+        setVideoId(null);
+      } finally {
+        setLoadingTranscript(false);
+      }
+    },
+    [urlInput, translateSegments, cookies],
+  );
+
+  // When sentence mode is toggled on the first time, fetch sentence-level
+  // translations for higher quality. Cached afterwards.
+  useEffect(() => {
+    if (!sentenceMode || !loaded || sentenceTranslations) return;
+    if (sentences.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      setTranslatingSentences(true);
+      try {
+        const res = await fetch("/api/translate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            texts: sentences.map((s) => s.text),
+            target: "vi",
+          }),
+        });
+        const json = await res.json();
+        if (!res.ok) throw new Error(json?.error ?? "Dịch thất bại.");
+        if (!cancelled) {
+          setSentenceTranslations((json.translations as string[]) ?? []);
+        }
+      } catch {
+        // Silent fallback: we already have per-segment translations stitched.
+      } finally {
+        if (!cancelled) setTranslatingSentences(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sentenceMode, loaded, sentenceTranslations, sentences]);
+
+  const handleSeek = useCallback((time: number) => {
+    if (!playerRef.current) return;
+    try {
+      playerRef.current.seekTo(time, true);
+      playerRef.current.playVideo();
+    } catch {
+      // ignore
+    }
+  }, []);
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="min-h-screen bg-zinc-950 text-zinc-100">
+      <header className="border-b border-zinc-800/80">
+        <div className="mx-auto max-w-7xl px-4 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h1 className="text-lg sm:text-xl font-semibold tracking-tight">
+              YouTube Subtitle Translator
+            </h1>
+            <p className="text-xs sm:text-sm text-zinc-400">
+              Paste link video YouTube có sẵn phụ đề → xem phụ đề gốc + bản dịch Tiếng Việt.
+            </p>
+          </div>
+          <form
+            onSubmit={handleSubmit}
+            className="flex w-full sm:w-auto items-center gap-2"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+            <input
+              type="text"
+              value={urlInput}
+              onChange={(e) => setUrlInput(e.target.value)}
+              placeholder="https://youtube.com/watch?v=…"
+              className="flex-1 sm:w-96 rounded-md bg-zinc-900 border border-zinc-700 px-3 py-2 text-sm placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-yellow-500/60"
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+            <button
+              type="submit"
+              disabled={loadingTranscript}
+              className="rounded-md bg-yellow-500 px-4 py-2 text-sm font-semibold text-zinc-950 hover:bg-yellow-400 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {loadingTranscript ? "Đang tải…" : "Tải"}
+            </button>
+          </form>
         </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl px-4 py-6">
+        {errorMessage ? (
+          <div className="mb-4 rounded-md border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm text-red-200">
+            {errorMessage}
+          </div>
+        ) : null}
+
+        {!videoId ? (
+          <EmptyState />
+        ) : (
+          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+            <section>
+              <div className="relative w-full overflow-hidden rounded-xl bg-black aspect-video">
+                <YouTubePlayer
+                  videoId={videoId}
+                  onReady={(player) => {
+                    playerRef.current = player;
+                  }}
+                  onTimeUpdate={(t) => setCurrentTime(t)}
+                />
+                <SubtitleOverlay
+                  original={activeItem?.original}
+                  translated={activeItem?.translated}
+                  loadingTranslation={
+                    !!activeItem?.original &&
+                    !activeItem?.translated &&
+                    (translatingSegments || translatingSentences)
+                  }
+                />
+              </div>
+
+              {loaded ? (
+                <div className="mt-4 flex flex-wrap items-center gap-3 text-sm">
+                  <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-zinc-600 bg-zinc-800 text-yellow-500 focus:ring-yellow-500"
+                      checked={sentenceMode}
+                      onChange={(e) => setSentenceMode(e.target.checked)}
+                    />
+                    <span>Ghép thành câu hoàn chỉnh</span>
+                  </label>
+                  <span className="text-zinc-500">
+                    {sentenceMode
+                      ? `${sentences.length} câu`
+                      : `${loaded.data.segments.length} dòng`}
+                  </span>
+                  <span className="text-zinc-500">
+                    Phụ đề gốc:{" "}
+                    <span className="text-zinc-300">
+                      {loaded.data.track.languageName}
+                      {loaded.data.track.kind === "asr" ? " (auto)" : ""}
+                    </span>
+                  </span>
+                  {translatingSegments ? (
+                    <span className="text-yellow-300">Đang dịch…</span>
+                  ) : null}
+                </div>
+              ) : null}
+            </section>
+
+            <aside className="rounded-xl border border-zinc-800 bg-zinc-900/40 h-[60vh] lg:h-[78vh] overflow-hidden">
+              {loadingTranscript ? (
+                <div className="flex h-full items-center justify-center text-sm text-zinc-400">
+                  Đang tải phụ đề…
+                </div>
+              ) : (
+                <SubtitleList
+                  items={items}
+                  activeIndex={activeIndex}
+                  onSeek={handleSeek}
+                  emptyMessage="Chưa có phụ đề được tải."
+                />
+              )}
+            </aside>
+          </div>
+        )}
       </main>
+
+      <footer className="mx-auto max-w-7xl px-4 py-6 text-xs text-zinc-500 space-y-3">
+        <p>
+          Dịch thuật dùng endpoint Google Translate miễn phí — chất lượng có thể
+          khác bản trả phí. Chỉ hoạt động với video có sẵn phụ đề.
+        </p>
+        <details
+          className="rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2"
+          open={cookiesOpen}
+          onToggle={(e) => setCookiesOpen((e.target as HTMLDetailsElement).open)}
+        >
+          <summary className="cursor-pointer text-zinc-300 select-none">
+            Cookies YouTube (nâng cao)
+            {cookies ? (
+              <span className="ml-2 text-emerald-400">• đã lưu</span>
+            ) : null}
+          </summary>
+          <div className="mt-3 space-y-2 text-zinc-400">
+            <p>
+              Nếu gặp lỗi <em>“Sign in to confirm you’re not a bot”</em>, bạn có
+              thể dán cookies YouTube của mình vào đây để app fetch được phụ đề
+              của mọi video bạn xem được trong trình duyệt.
+            </p>
+            <p>
+              Cách lấy nhanh: cài extension{" "}
+              <a
+                className="text-yellow-300 underline"
+                href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Get cookies.txt LOCALLY
+              </a>
+              , mở youtube.com (đã đăng nhập), bấm extension → Export → dán nội
+              dung file vào ô dưới. Cũng có thể dán dạng{" "}
+              <code>name=value; name2=value2</code>.
+            </p>
+            <textarea
+              value={cookies}
+              onChange={(e) => saveCookies(e.target.value)}
+              placeholder="# Netscape HTTP Cookie File ... hoặc name=value; ..."
+              spellCheck={false}
+              className="w-full h-32 rounded bg-zinc-900 border border-zinc-700 p-2 font-mono text-[11px] text-zinc-200 focus:outline-none focus:ring-2 focus:ring-yellow-500/60"
+            />
+            <p className="text-[11px] text-zinc-500">
+              Cookies lưu tại trình duyệt của bạn (localStorage) và chỉ gửi tới
+              server của app này.
+            </p>
+          </div>
+        </details>
+      </footer>
+    </div>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-900/30 p-10 text-center">
+      <h2 className="text-base font-semibold text-zinc-200">
+        Bắt đầu bằng cách paste link YouTube
+      </h2>
+      <p className="mt-2 text-sm text-zinc-400">
+        Hỗ trợ các dạng link: <code>youtube.com/watch?v=…</code>,{" "}
+        <code>youtu.be/…</code>, <code>youtube.com/shorts/…</code>.
+      </p>
+      <p className="mt-1 text-sm text-zinc-500">
+        Video phải có sẵn phụ đề (manual hoặc auto-generated).
+      </p>
     </div>
   );
 }
